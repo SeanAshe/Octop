@@ -2,7 +2,7 @@ name: Sync Upstream Release
 
 # 上游 TencentCloud/Octop 发布 GitHub Release 之后：
 #   1. 将该 release 合并进本仓库 main（有冲突则失败，不覆盖 fork 自己的提交）
-#   2. 用该 release 的提交构建镜像，推到 GHCR
+#   2. 用合并后的 main 构建镜像并推到 GHCR（保留 fork 自己的修复）
 #
 # 镜像标签与上游 release 标签一致（例如 v1.0.2b5），并把 latest 指向
 # 当前最新一次 release。只处理最新 release；补打历史标签请手动 Run workflow。
@@ -20,6 +20,11 @@ on:
         description: "上游 release 标签，例如 v1.0.2b5。留空则使用最新发布的 release。"
         required: false
         type: string
+      force:
+        description: "即使 GHCR 已有该标签也重新构建并覆盖。"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -120,10 +125,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.rel.outputs.tag }}
+          FORCE: ${{ inputs.force == true && 'true' || 'false' }}
         run: |
           set -euo pipefail
           owner_lc="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           echo "name=ghcr.io/${owner_lc}/octop" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Force rebuild requested for ${TAG}."
+            exit 0
+          fi
 
           owner_type="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .owner.type)"
           if [ "$owner_type" = "Organization" ]; then
@@ -153,12 +164,6 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Check out release commit
-        if: steps.image.outputs.exists != 'true'
-        env:
-          SHA: ${{ steps.sync.outputs.sha }}
-        run: git checkout --detach "$SHA"
 
       - name: Set up Docker Buildx
         if: steps.image.outputs.exists != 'true'

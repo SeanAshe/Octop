@@ -13,14 +13,18 @@
 #
 # 密码兜底（修复 issue #502）：应用侧密码策略带常见弱密码黑名单（含
 # Octop123），旧版默认密码会让 octop init 报 "password is too common"
-# 退出、容器反复重启。现在：未设置密码时自动生成随机强密码；指定的
-# 密码被策略拒绝时也自动改用随机密码重试，保证容器一定能完成首次初始化。
+# 退出、容器反复重启。现在：未设置密码时自动生成随机强密码；只有错误
+# 信息确认为密码策略拒绝时，才用随机密码加 --force 重试（失败的 init
+# 可能已经写入了半成品目录）。
+#
+# 是否首次启动看数据目录是否为空，而不是看 octop.db 在不在。PostgreSQL
+# 以及已有 config/日志的目录都没有这个文件；重启时再跑 octop init 会被
+# 「目录非空」拒绝，容器直接退出。
 # =============================================================================
 set -euo pipefail
 
 export HOME="${HOME:-/data}"
 OCTOP_HOME="${HOME}/.octop"
-DB_FILE="${OCTOP_HOME}/octop.db"
 CREDENTIAL_FILE="${OCTOP_HOME}/credential.txt"
 ADMIN_USERNAME="${OCTOP_ADMIN_USERNAME:-admin}"
 ADMIN_DISPLAY_NAME="${OCTOP_ADMIN_DISPLAY_NAME:-Admin}"
@@ -44,7 +48,31 @@ octop_random_password() {
 
 DEFAULT_PASSWORD="${OCTOP_DEFAULT_PASSWORD:-}"
 
-if [ ! -f "$DB_FILE" ]; then
+octop_home_nonempty() {
+    [ -d "$OCTOP_HOME" ] && [ -n "$(ls -A "$OCTOP_HOME" 2>/dev/null || true)" ]
+}
+
+run_octop_init() {
+    local password="$1"
+    local force="${2:-}"
+    local -a args=(
+        init
+        --yes
+        --admin-username "$ADMIN_USERNAME"
+        --admin-password "$password"
+    )
+    if [ -n "$force" ]; then
+        args+=(--force)
+    fi
+    if [ -n "$ADMIN_DISPLAY_NAME" ]; then
+        args+=(--admin-display-name "$ADMIN_DISPLAY_NAME")
+    fi
+    octop "${args[@]}"
+}
+
+if octop_home_nonempty; then
+    echo "[entrypoint] 数据目录已存在（${OCTOP_HOME}），跳过初始化。"
+else
     echo "[entrypoint] 首次启动，正在初始化 Octop..."
 
     if [ -z "$DEFAULT_PASSWORD" ]; then
@@ -52,20 +80,26 @@ if [ ! -f "$DB_FILE" ]; then
         echo "[entrypoint] 未设置 OCTOP_DEFAULT_PASSWORD，已自动生成随机密码。"
     fi
 
-    if ! octop init \
-        --yes \
-        --admin-username "$ADMIN_USERNAME" \
-        --admin-password "$DEFAULT_PASSWORD" \
-        ${ADMIN_DISPLAY_NAME:+--admin-display-name "$ADMIN_DISPLAY_NAME"}; then
-        echo "[entrypoint] 指定的初始密码未通过应用密码策略（过弱或过于常见），改用随机密码重试 ..."
-        DEFAULT_PASSWORD="$(octop_random_password)"
-        octop init \
-            --yes \
-            --admin-username "$ADMIN_USERNAME" \
-            --admin-password "$DEFAULT_PASSWORD" \
-            ${ADMIN_DISPLAY_NAME:+--admin-display-name "$ADMIN_DISPLAY_NAME"}
+    init_log="$(mktemp)"
+    set +e
+    run_octop_init "$DEFAULT_PASSWORD" >"$init_log" 2>&1
+    init_status=$?
+    set -e
+    cat "$init_log" >&2
+    if [ "$init_status" -ne 0 ]; then
+        if grep -Eq 'password (is too common|too short|must include letters and digits)' "$init_log"; then
+            echo "[entrypoint] 指定的初始密码未通过应用密码策略（过弱或过于常见），改用随机密码重试 ..."
+            DEFAULT_PASSWORD="$(octop_random_password)"
+            # 密码校验发生在写库之后，目录已经不是空的，必须 --force 才能重试。
+            run_octop_init "$DEFAULT_PASSWORD" --force
+        else
+            rm -f "$init_log"
+            exit "$init_status"
+        fi
     fi
+    rm -f "$init_log"
 
+    mkdir -p "$OCTOP_HOME"
     cat > "$CREDENTIAL_FILE" << EOF
 Octop Login Credential
 ======================
