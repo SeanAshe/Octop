@@ -1,0 +1,217 @@
+name: Sync Upstream Release
+
+# 上游 TencentCloud/Octop 发布 GitHub Release 之后：
+#   1. 将该 release 合并进本仓库 main（有冲突则失败，不覆盖 fork 自己的提交）
+#   2. 用该 release 的提交构建镜像，推到 GHCR
+#
+# 镜像标签与上游 release 标签一致（例如 v1.0.2b5），并把 latest 指向
+# 当前最新一次 release。只处理最新 release；补打历史标签请手动 Run workflow。
+#
+# 不推送 v* git tag。推 tag 会触发本仓库继承的 Release / Docker Hub 发布流程。
+# 上游没有可供 fork 订阅的 release 事件，因此用定时轮询。
+# schedule 只在默认分支上的这份文件生效，且仓库需开启 Actions（contents 可写）。
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "上游 release 标签，例如 v1.0.2b5。留空则使用最新发布的 release。"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: TencentCloud/Octop
+
+jobs:
+  sync-and-publish:
+    name: Sync release and publish image
+    if: github.repository != 'TencentCloud/Octop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag || '' }}
+        run: |
+          set -euo pipefail
+          newest="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=1" --jq '.[0].tag_name')"
+          if [ -z "$newest" ] || [ "$newest" = "null" ]; then
+            echo "::error::Upstream has no published releases"
+            exit 1
+          fi
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+            gh api "repos/${UPSTREAM_REPO}/releases/tags/${tag}" --jq .tag_name >/dev/null
+          else
+            tag="$newest"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::Refusing release tag ${tag}"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if [ "$tag" = "$newest" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Release ${tag} (newest=${newest})"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync main to upstream release
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --force "https://github.com/${UPSTREAM_REPO}.git" \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
+          sha="$(git rev-parse "${TAG}^{commit}")"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          if [ "$branch" = "HEAD" ]; then
+            echo "::error::Expected checkout of main, got a detached HEAD"
+            exit 1
+          fi
+
+          before="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$sha" "$before"; then
+            echo "main already contains ${TAG} (${sha})."
+          else
+            if ! git merge --no-edit -m "chore: sync upstream release ${TAG}" "$sha"; then
+              echo "::error::Merge of ${TAG} into ${branch} conflicted. Resolve it on the fork, then re-run this workflow."
+              exit 1
+            fi
+            # 快进到上游时，分支树会变成 release 的树，本工作流文件会消失。
+            # 补回后再推，否则下一次 schedule 不再存在。
+            workflow=".github/workflows/sync-upstream-release.yml"
+            if [ ! -f "$workflow" ]; then
+              git checkout "$before" -- "$workflow"
+              git add "$workflow"
+              git commit -m "chore: keep upstream release sync workflow after ${TAG}"
+            fi
+            git push origin "HEAD:refs/heads/${branch}"
+            echo "Synced ${TAG} into ${branch}."
+          fi
+
+      - name: Check existing GHCR tag
+        id: image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          owner_lc="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner_lc}/octop" >> "$GITHUB_OUTPUT"
+
+          owner_type="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .owner.type)"
+          if [ "$owner_type" = "Organization" ]; then
+            api="/orgs/${owner_lc}/packages/container/octop/versions"
+          else
+            api="/users/${owner_lc}/packages/container/octop/versions"
+          fi
+
+          set +e
+          gh api --paginate "$api" --jq '.[] | .metadata.container.tags[]?' \
+            > /tmp/ghcr-tags.txt 2>/tmp/ghcr-err
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            if grep -Eq 'Not Found \(HTTP 404\)|HTTP 404' /tmp/ghcr-err; then
+              : > /tmp/ghcr-tags.txt
+            else
+              echo "::error::Failed to list GHCR package versions"
+              cat /tmp/ghcr-err >&2
+              exit 1
+            fi
+          fi
+
+          if grep -Fxq "$TAG" /tmp/ghcr-tags.txt; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "GHCR already has ${TAG}; skip image build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out release commit
+        if: steps.image.outputs.exists != 'true'
+        env:
+          SHA: ${{ steps.sync.outputs.sha }}
+        run: git checkout --detach "$SHA"
+
+      - name: Set up Docker Buildx
+        if: steps.image.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.image.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        if: steps.image.outputs.exists != 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ steps.rel.outputs.tag }}
+            type=raw,value=latest,enable=${{ steps.rel.outputs.is_latest == 'true' }}
+
+      - name: Build and push
+        if: steps.image.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarize
+        if: success()
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          EXISTS: ${{ steps.image.outputs.exists }}
+          IS_LATEST: ${{ steps.rel.outputs.is_latest }}
+        run: |
+          {
+            echo "## Upstream release ${TAG}"
+            echo ""
+            if [ "$EXISTS" = "true" ]; then
+              echo "GHCR already has \`${IMAGE}:${TAG}\`. Image build skipped."
+            else
+              echo "Pushed \`${IMAGE}:${TAG}\`."
+              if [ "$IS_LATEST" = "true" ]; then
+                echo "Pushed \`${IMAGE}:latest\`."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
