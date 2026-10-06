@@ -42,6 +42,7 @@ def _run(
     log = tmp_path / "octop-calls.log"
     env = os.environ.copy()
     env["HOME"] = str(home)
+    env.pop("OCTOP_HOME", None)
     env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
     env["OCTOP_STUB_LOG"] = str(log)
     env.pop("OCTOP_DEFAULT_PASSWORD", None)
