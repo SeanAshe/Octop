@@ -79,24 +79,25 @@ def test_restart_skips_init_when_data_dir_is_not_empty(tmp_path: Path) -> None:
     assert result.returncode == 0, output
     assert "跳过初始化" in output
     assert "首次启动" not in output
-    assert "密码" not in output
     assert "init " not in stub_log
     assert "run --host 0.0.0.0 --port 8088" in stub_log
     assert not (data / "credential.txt").exists()
+    assert not (data / "octop-login.txt").exists()
 
 
 @posix_only
-def test_empty_data_dir_still_runs_init(tmp_path: Path) -> None:
+def test_empty_data_dir_starts_wizard_without_init(tmp_path: Path) -> None:
     result, stub_log = _run(tmp_path)
     output = result.stdout + result.stderr
-    calls = stub_log.splitlines()
 
     assert result.returncode == 0, output
     assert "首次启动" in output
-    assert calls[0].startswith("init --yes ")
-    assert "--force" not in calls[0]
-    assert calls[1] == "run --host 0.0.0.0 --port 8088"
-    assert (tmp_path / "data" / ".octop" / "credential.txt").is_file()
+    assert "未设置 OCTOP_DEFAULT_PASSWORD" in output
+    assert "init " not in stub_log
+    assert "run --host 0.0.0.0 --port 8088" in stub_log
+    data = tmp_path / "data" / ".octop"
+    assert (data / "octop-login.txt").is_file()
+    assert "Setup Required" in (data / "credential.txt").read_text(encoding="utf-8")
 
 
 @posix_only
@@ -110,43 +111,24 @@ def test_existing_directory_without_sqlite_file_is_not_first_boot(tmp_path: Path
     output = result.stdout + result.stderr
 
     assert result.returncode == 0, output
+    assert "跳过初始化" in output
     assert "init " not in stub_log
     assert (data / "credential.txt").read_text(encoding="utf-8") == "kept\n"
-
-
-@posix_only
-def test_password_rejection_retries_with_force(tmp_path: Path) -> None:
-    result, stub_log = _run(
-        tmp_path,
-        fail_message="error: password is too common\n",
-        extra_env={"OCTOP_DEFAULT_PASSWORD": "octop123"},
-    )
-    output = result.stdout + result.stderr
-    calls = stub_log.splitlines()
-
-    assert result.returncode == 0, output
-    assert "改用随机密码重试" in output
-    assert "octop123" in calls[0]
-    assert "--force" not in calls[0]
-    assert "--force" in calls[1]
-    assert "octop123" not in calls[1]
-    assert calls[2] == "run --host 0.0.0.0 --port 8088"
-    credential = (tmp_path / "data" / ".octop" / "credential.txt").read_text(encoding="utf-8")
-    assert "octop123" not in credential
 
 
 @posix_only
 def test_non_password_init_failure_is_not_retried(tmp_path: Path) -> None:
     result, stub_log = _run(
         tmp_path,
-        fail_message="error: /data/.octop already exists and is not empty. Use --force to reset.\n",
+        fail_message="error: database is locked\n",
+        extra_env={"OCTOP_DEFAULT_PASSWORD": "GoodPass1"},
     )
     output = result.stdout + result.stderr
     calls = stub_log.splitlines()
 
     assert result.returncode != 0
-    assert "already exists" in output
-    assert "改用随机密码重试" not in output
+    assert "不是密码策略问题" in output
+    assert "改为启动设置向导" not in output
     assert len(calls) == 1
     assert calls[0].startswith("init ")
     assert "--force" not in calls[0]
